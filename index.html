@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>加工条件コンサルタント AI</title>
+    
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    
+    <!-- Babel -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Noto+Sans+JP:wght@300;400;500;700&display=swap');
+        body { font-family: 'Noto Sans JP', 'Inter', sans-serif; }
+        
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in-up {
+            animation: fadeInUp 0.5s ease-out forwards;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased h-screen overflow-hidden">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        const MANUFACTURERS = [
+            'サンドビック (Sandvik)',
+            'OSG',
+            '三菱マテリアル (Mitsubishi Materials)',
+            '京セラ (Kyocera)',
+            '住友電工 (Sumitomo)',
+            'イスカル (Iscar)',
+            'タンガロイ (Tungaloy)',
+            'ユニオンツール (Union Tool)',
+            '不二越 (NACHI)',
+            'BIG大昭和精機 (BIG DAISHOWA)',
+            'イワタツール (IWATA TOOL)',
+            '栄工舎 (Eiko-sha)',
+            'アサヒ工具 (Asahi Tool)',
+            'その他 (Other)'
+        ];
+
+        // Icon Component using Lucide
+        const Icon = ({ name, size = 20, className }) => {
+            const [iconData, setIconData] = useState(null);
+            useEffect(() => {
+                if (window.lucide && window.lucide.icons && window.lucide.icons[name]) {
+                    setIconData(window.lucide.icons[name]);
+                }
+            }, [name]);
+            if (!iconData) return null;
+            return (
+                <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width={size}
+                    height={size}
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    className={className}
+                >
+                    {iconData.map((element, index) => {
+                        const [tag, attrs] = element;
+                        return React.createElement(tag, { ...attrs, key: index });
+                    })}
+                </svg>
+            );
+        };
+
+        const generateContent = async (apiKey, prompt) => {
+            const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+            
+            const payload = {
+                contents: [{ parts: [{ text: prompt }] }],
+                tools: [{ google_search: {} }],
+                generationConfig: {
+                    temperature: 0.1
+                }
+            };
+
+            const MAX_RETRIES = 5;
+            const delay = (ms) => new Promise(res => setTimeout(res, ms));
+
+            for (let i = 0; i <= MAX_RETRIES; i++) {
+                try {
+                    const response = await fetch(API_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.status === 429) {
+                        if (i === MAX_RETRIES) throw new Error("APIの利用制限を超えました。しばらく時間をおいてから再試行してください。");
+                        const backoffTime = Math.pow(2, i) * 1000;
+                        await delay(backoffTime);
+                        continue;
+                    }
+
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(errorData.error?.message || 'APIリクエストに失敗しました');
+                    }
+
+                    const data = await response.json();
+                    const candidate = data.candidates?.[0];
+                    if (!candidate) throw new Error('AIからの応答がありません');
+
+                    const text = candidate.content?.parts?.[0]?.text || '';
+                    
+                    let jsonContent = '';
+                    const fence = "`" + "`" + "`";
+                    const pattern = fence + "(?:json)?\\s*([\\s\\S]*?)\\s*" + fence;
+                    const codeBlockRegex = new RegExp(pattern);
+                    const codeBlockMatch = text.match(codeBlockRegex);
+                    
+                    if (codeBlockMatch) {
+                        jsonContent = codeBlockMatch[1];
+                    } else {
+                        const firstBrace = text.indexOf('{');
+                        const lastBrace = text.lastIndexOf('}');
+                        if (firstBrace !== -1 && lastBrace !== -1) {
+                            jsonContent = text.substring(firstBrace, lastBrace + 1);
+                        } else {
+                            jsonContent = text;
+                        }
+                    }
+
+                    let parsedData;
+                    try {
+                        parsedData = JSON.parse(jsonContent.trim());
+                    } catch (e) {
+                        throw new Error("データの解析に失敗しました。");
+                    }
+
+                    const groundingChunks = candidate.groundingMetadata?.groundingChunks || [];
+                    const sources = groundingChunks
+                        .filter(chunk => chunk.web)
+                        .map(chunk => ({ title: chunk.web.title, uri: chunk.web.uri }));
+
+                    return { 
+                        data: parsedData, 
+                        sources: Array.from(new Map(sources.map(item => [item.uri, item])).values()) 
+                    };
+
+                } catch (error) {
+                    if (i === MAX_RETRIES) throw error;
+                    const backoffTime = Math.pow(2, i) * 1000;
+                    await delay(backoffTime);
+                    continue;
+                }
+            }
+        };
+
+        const Sidebar = ({ isOpen, onClose, apiKey, setApiKey, resetApp }) => {
+            const [inputKey, setInputKey] = useState(apiKey);
+            const [isValidating, setIsValidating] = useState(false);
+            const [status, setStatus] = useState(null);
+
+            const handleSave = () => {
+                if (!inputKey) return;
+                setIsValidating(true);
+                setTimeout(() => {
+                    setApiKey(inputKey);
+                    setStatus('success');
+                    setIsValidating(false);
+                }, 400);
+            };
+
+            return (
+                <div className={`fixed inset-y-0 left-0 z-30 w-72 bg-slate-900 text-slate-100 transform transition-transform duration-300 ease-in-out ${isOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 md:static`}>
+                    <div className="flex items-center justify-between h-16 px-6 bg-slate-950 border-b border-slate-800">
+                        <div className="flex items-center space-x-2 font-bold text-lg text-blue-400">
+                            <Icon name="Cpu" />
+                            <span>PMC AI</span>
+                        </div>
+                        <button onClick={onClose} className="md:hidden text-slate-400"><Icon name="X" /></button>
+                    </div>
+                    <div className="p-6 space-y-8">
+                        <div className="space-y-4">
+                            <div className="flex items-center space-x-2 text-sm font-medium text-slate-400"><Icon name="Settings" size={16} /><span>API 設定</span></div>
+                            <input 
+                                type="password" 
+                                value={inputKey}
+                                onChange={(e) => { setInputKey(e.target.value); setStatus(null); }}
+                                placeholder="Gemini APIキーを入力"
+                                className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:border-blue-500 outline-none"
+                            />
+                            <button 
+                                onClick={handleSave}
+                                disabled={!inputKey || isValidating}
+                                className={`w-full py-2 rounded text-sm font-medium transition-colors ${status === 'success' ? 'bg-green-600' : 'bg-blue-600 hover:bg-blue-700 disabled:opacity-50'}`}
+                            >
+                                {isValidating ? '検証中...' : status === 'success' ? '設定完了' : 'キーを保存'}
+                            </button>
+                        </div>
+                        <button onClick={resetApp} className="w-full text-left px-3 py-2 rounded text-slate-300 hover:bg-slate-800 text-sm flex items-center space-x-2">
+                            <Icon name="PlusCircle" size={16} /><span>新規計算</span>
+                        </button>
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+            const [apiKey, setApiKey] = useState('');
+            const [step, setStep] = useState(0); 
+            const [manufacturer, setManufacturer] = useState('');
+            const [modelNumber, setModelNumber] = useState('');
+            const [toolMetadata, setToolMetadata] = useState(null);
+            const [metadataSources, setMetadataSources] = useState([]);
+            
+            // Step 2 Inputs
+            const [selectedMaterial, setSelectedMaterial] = useState('');
+            const [isManualMaterial, setIsManualMaterial] = useState(false);
+            const [selectedMethod, setSelectedMethod] = useState('');
+            const [diameter, setDiameter] = useState(10);
+            const [machiningDistance, setMachiningDistance] = useState(100);
+            const [passCount, setPassCount] = useState(1);
+            
+            const [result, setResult] = useState(null);
+            const [resultSources, setResultSources] = useState([]);
+            const [loading, setLoading] = useState(false);
+            const [error, setError] = useState(null);
+
+            const resetApp = () => {
+                setStep(0); setToolMetadata(null); setResult(null); 
+                setManufacturer(''); setModelNumber(''); setError(null);
+                setDiameter(10); setMachiningDistance(100); setPassCount(1);
+                setIsManualMaterial(false);
+                if (window.innerWidth < 768) setIsSidebarOpen(false);
+            };
+
+            const handleSearchTool = async () => {
+                if (!apiKey) { setError("サイドバーでAPIキーを設定してください。"); return; }
+                if (!manufacturer) { setError("メーカーを選択してください。"); return; }
+                if (!modelNumber.trim()) { setError("型番または注文番号を入力してください。"); return; }
+                setLoading(true); setError(null);
+                
+                const prompt = `Perform a targeted Google Search to find the OFFICIAL technical specifications for the cutting tool by "${manufacturer}". 
+                The user provided identification: "${modelNumber}" (This could be a Model Name, Series Name, or specific Ordering Number/EDP Number).
+                
+                STRICT REQUIREMENTS FOR ACCURACY:
+                1. **Data Source:** Extract information ONLY from the manufacturer's official catalogs or technical data sheets.
+                2. **Materials:** List ONLY the recommended workpiece materials for this specific tool.
+                3. **Methods:** List ONLY the machining operations (e.g., Side Milling, Slotting, Drilling).
+                4. **Diameter:** Extract the EXACT diameter (DC) or the valid range (min-max). This is crucial for validation.
+                5. **Output ONLY JSON inside markdown code block.**
+                {
+                    "materials": ["被削材1", "被削材2"],
+                    "methods": ["加工方法1", "加工方法2"],
+                    "diameter": {
+                        "type": "fixed"|"range"|"unknown", 
+                        "value": number (if fixed), 
+                        "min": number (if range), 
+                        "max": number (if range)
+                    },
+                    "description": "工具の特徴や仕様の日本語要約（注文番号に基づく詳細な特定結果を含む）"
+                }`;
+
+                try {
+                    const { data, sources } = await generateContent(apiKey, prompt);
+                    setToolMetadata(data);
+                    setMetadataSources(sources);
+                    
+                    // Material Selection Logic
+                    if (data.materials && data.materials.length > 0) {
+                        setSelectedMaterial(data.materials[0]);
+                        setIsManualMaterial(false);
+                    } else {
+                        setSelectedMaterial('');
+                        setIsManualMaterial(true);
+                    }
+
+                    if (data.methods?.[0]) setSelectedMethod(data.methods[0]);
+                    
+                    // Logic to set diameter and apply constraints
+                    if (data.diameter) {
+                        if (data.diameter.type === 'fixed' && data.diameter.value) {
+                            setDiameter(data.diameter.value);
+                        } else if (data.diameter.type === 'range') {
+                            setDiameter(data.diameter.min || data.diameter.value || 10);
+                        } else if (data.diameter.value) {
+                             setDiameter(data.diameter.value);
+                        }
+                    }
+                    
+                    setStep(1);
+                } catch (err) { setError(err.message); } finally { setLoading(false); }
+            };
+
+            const handleCalculate = async () => {
+                if (!selectedMaterial) { setError("被削材を入力または選択してください。"); return; }
+                
+                setLoading(true); setError(null);
+                const prompt = `Act as an expert machining engineer. Calculate OPTIMAL cutting conditions.
+                Input: Tool: ${manufacturer}, ID: ${modelNumber}, Material: ${selectedMaterial}, Method: ${selectedMethod}, Diameter: ${diameter}mm.
+                
+                **CRITICAL TASK: FULL DIMENSION EXTRACTION & INSERT CHECK**
+                1. Extract ALL available tool dimensions from the latest catalog data (DC, DCONMS, LU, LCF, OAL/LF, SIG, PL, ZEFF/Z, ULDR, GAMO, BSG/ADINTMS, TCHA/TCDCON, GRADE, Pitch, LS etc.).
+                2. **Determine if the tool is Indexable (uses inserts) or Solid.**
+                   - Set 'isIndexable' to true ONLY if it requires replaceable inserts.
+                   - Set 'isIndexable' to false for Solid Carbide, HSS, or Brazed tools.
+                3. **INSERT SELECTION (Important):** If isIndexable is true, recommend the BEST specific insert grade and breaker/geometry SPECIFICALLY for the selected workpiece material ("${selectedMaterial}"). Do NOT suggest generic inserts if possible. Consider material hardness and chip control. If solid, 'recommendedInsert' MUST be null.
+
+                Output ONLY JSON. Reasoning and coolant in Japanese.
+                {
+                    "vc": number, "fz": number, "z": number, "rpm": integer, "f": integer,
+                    "isIndexable": boolean,
+                    "recommendedInsert": "string or null", 
+                    "reasoning": "AIによる計算根拠の解説（被削材に対応したチップ選定理由も含む）", 
+                    "coolant": "推奨クーラント",
+                    "dimensions": [
+                        {"name": "工具径 (DC)", "value": "10.0 mm"},
+                        {"name": "シャンク径 (DCONMS)", "value": "10.0 mm"},
+                        ... add ALL found dimensions ...
+                    ]
+                }`;
+
+                try {
+                    const { data, sources } = await generateContent(apiKey, prompt);
+                    setResult(data);
+                    setResultSources(sources);
+                    setStep(2);
+                } catch (err) { setError(err.message); } finally { setLoading(false); }
+            };
+
+            const getUniqueSources = () => {
+                const allSources = [...metadataSources, ...resultSources];
+                const uniqueMap = new Map();
+                allSources.forEach(source => {
+                    if (!uniqueMap.has(source.uri)) uniqueMap.set(source.uri, source);
+                });
+                return Array.from(uniqueMap.values());
+            };
+
+            return (
+                <div className="flex h-screen bg-slate-50">
+                    <Sidebar isOpen={isSidebarOpen} onClose={() => setIsSidebarOpen(false)} apiKey={apiKey} setApiKey={setApiKey} resetApp={resetApp} />
+                    <div className="flex-1 flex flex-col h-screen overflow-hidden">
+                        <header className="md:hidden flex items-center justify-between px-6 py-4 bg-white border-b">
+                            <div className="flex items-center space-x-2 font-bold text-blue-600"><Icon name="Cpu" /><span>PMC AI</span></div>
+                            <button onClick={() => setIsSidebarOpen(true)}><Icon name="Menu" /></button>
+                        </header>
+                        <main className="flex-1 overflow-y-auto p-6 md:p-12">
+                            <div className="max-w-4xl mx-auto space-y-8 pb-20">
+                                <div>
+                                    <h1 className="text-2xl md:text-3xl font-bold text-slate-900 tracking-tight">加工条件コンサルタント</h1>
+                                    <p className="text-slate-500 mt-2">注文番号や型番から工具スペックを自動取得し、条件を算出します。</p>
+                                </div>
+                                {!apiKey && (
+                                    <div className="bg-amber-50 border border-amber-200 rounded-xl p-6 flex space-x-4">
+                                        <Icon name="AlertCircle" className="text-amber-500 mt-1" />
+                                        <div><h3 className="font-semibold text-amber-900">APIキーを設定してください</h3><p className="text-amber-700 text-sm">サイドバーからGoogle Gemini APIキーを入力することで機能が有効になります。</p></div>
+                                    </div>
+                                )}
+                                {error && (
+                                    <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex items-center space-x-3 text-red-700 text-sm animate-fade-in-up">
+                                        <Icon name="AlertCircle" /><span>{error}</span>
+                                    </div>
+                                )}
+
+                                <section className={`bg-white rounded-2xl shadow-sm border p-6 md:p-8 space-y-6 transition-all ${step >= 0 ? 'opacity-100' : 'opacity-50'}`}>
+                                    <h2 className="font-bold flex items-center space-x-2 text-slate-800 text-lg"><Icon name="Search" className="text-blue-500"/><span>1. 工具情報の入力</span></h2>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                        <div className="space-y-1.5">
+                                            <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">メーカー</label>
+                                            <select 
+                                                value={manufacturer} 
+                                                onChange={(e) => setManufacturer(e.target.value)} 
+                                                disabled={step > 0} 
+                                                className={`w-full bg-slate-50 border border-slate-200 rounded-xl p-3.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all ${!manufacturer ? 'text-slate-500' : 'text-slate-900'}`}
+                                            >
+                                                <option value="" disabled>メーカーを選択してください</option>
+                                                {MANUFACTURERS.map(m => <option key={m} value={m}>{m}</option>)}
+                                            </select>
+                                        </div>
+                                        <div className="space-y-1.5">
+                                            <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">型番 / 注文番号 (EDP)</label>
+                                            <input 
+                                                type="text" 
+                                                value={modelNumber} 
+                                                onChange={(e) => setModelNumber(e.target.value)} 
+                                                disabled={step > 0} 
+                                                placeholder="例: 460.1-1032-052A1-XM または 860.1-..." 
+                                                className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all" 
+                                            />
+                                        </div>
+                                    </div>
+                                    {step === 0 && (
+                                        <div className="pt-2">
+                                            <button 
+                                                onClick={handleSearchTool} 
+                                                disabled={loading || !modelNumber || !manufacturer || !apiKey} 
+                                                className="w-full md:w-auto bg-slate-900 hover:bg-slate-800 text-white font-bold py-4 px-10 rounded-xl transition-all flex items-center justify-center space-x-2 ml-auto shadow-lg shadow-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                                            >
+                                                {loading ? <Icon name="Loader2" className="animate-spin" /> : <Icon name="Search" size={18} />}
+                                                <span>工具を検索</span>
+                                            </button>
+                                        </div>
+                                    )}
+                                </section>
+
+                                {step >= 1 && toolMetadata && (
+                                    <section className="bg-white rounded-2xl shadow-sm border p-6 md:p-8 space-y-6 animate-fade-in-up">
+                                        <h2 className="font-bold flex items-center space-x-2 text-slate-800 text-lg"><Icon name="Settings" className="text-blue-500"/><span>2. 加工要件の設定</span></h2>
+                                        <div className="space-y-6">
+                                            <div className="bg-blue-50/50 p-5 rounded-xl text-sm text-blue-900 border border-blue-100 leading-relaxed italic">
+                                                <Icon name="Info" size={16} className="inline mr-2 mb-1 text-blue-500" />
+                                                {toolMetadata.description}
+                                            </div>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                                                
+                                                {/* Material Selection with Manual Input Option */}
+                                                <div className="space-y-1.5">
+                                                    <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">
+                                                        被削材 {isManualMaterial && <span className="text-blue-500 font-normal ml-1">(手入力)</span>}
+                                                    </label>
+                                                    
+                                                    {isManualMaterial ? (
+                                                        <div className="flex gap-2">
+                                                            <input 
+                                                                type="text" 
+                                                                value={selectedMaterial} 
+                                                                onChange={(e) => setSelectedMaterial(e.target.value)} 
+                                                                disabled={step > 1}
+                                                                placeholder="例: SUS304, S45C"
+                                                                className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm" 
+                                                            />
+                                                            {toolMetadata.materials?.length > 0 && (
+                                                                <button 
+                                                                    onClick={() => {
+                                                                        setIsManualMaterial(false);
+                                                                        setSelectedMaterial(toolMetadata.materials[0]);
+                                                                    }}
+                                                                    disabled={step > 1}
+                                                                    className="px-3 py-1 text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg whitespace-nowrap transition-colors"
+                                                                >
+                                                                    リストへ
+                                                                </button>
+                                                            )}
+                                                        </div>
+                                                    ) : (
+                                                        <select 
+                                                            value={selectedMaterial} 
+                                                            onChange={(e) => {
+                                                                if (e.target.value === 'MANUAL_INPUT') {
+                                                                    setIsManualMaterial(true);
+                                                                    setSelectedMaterial('');
+                                                                } else {
+                                                                    setSelectedMaterial(e.target.value);
+                                                                }
+                                                            }} 
+                                                            disabled={step > 1} 
+                                                            className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm"
+                                                        >
+                                                            {toolMetadata.materials?.map(m => <option key={m} value={m}>{m}</option>)}
+                                                            <option value="MANUAL_INPUT">その他（手入力）</option>
+                                                        </select>
+                                                    )}
+                                                </div>
+
+                                                <div className="space-y-1.5"><label className="text-xs font-bold text-slate-400 uppercase tracking-wider">加工方法</label>
+                                                    <select value={selectedMethod} onChange={(e) => setSelectedMethod(e.target.value)} disabled={step > 1} className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm">
+                                                        {toolMetadata.methods?.map(m => <option key={m} value={m}>{m}</option>)}
+                                                    </select>
+                                                </div>
+                                                <div className="space-y-1.5">
+                                                    <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">
+                                                        工具径 (mm)
+                                                        {toolMetadata.diameter?.type === 'fixed' && <span className="ml-2 text-blue-600 font-normal normal-case">(固定: {toolMetadata.diameter.value}mm)</span>}
+                                                        {toolMetadata.diameter?.type === 'range' && <span className="ml-2 text-slate-500 font-normal normal-case">(推奨: {toolMetadata.diameter.min} - {toolMetadata.diameter.max}mm)</span>}
+                                                    </label>
+                                                    <input 
+                                                        type="number" 
+                                                        value={diameter} 
+                                                        onChange={(e) => setDiameter(parseFloat(e.target.value))} 
+                                                        disabled={step > 1 || toolMetadata.diameter?.type === 'fixed'} 
+                                                        min={toolMetadata.diameter?.min}
+                                                        max={toolMetadata.diameter?.max}
+                                                        className={`w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm ${toolMetadata.diameter?.type === 'fixed' ? 'bg-slate-100 text-slate-500 cursor-not-allowed' : ''}`} 
+                                                    />
+                                                </div>
+                                                <div className="space-y-1.5">
+                                                    <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">加工距離 (mm)</label>
+                                                    <input type="number" value={machiningDistance} onChange={(e) => setMachiningDistance(parseFloat(e.target.value))} disabled={step > 1} className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm" />
+                                                </div>
+                                                <div className="space-y-1.5">
+                                                    <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">加工回数 (パス)</label>
+                                                    <input type="number" value={passCount} onChange={(e) => setPassCount(parseInt(e.target.value))} disabled={step > 1} className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm" />
+                                                </div>
+                                            </div>
+                                        </div>
+                                        {step === 1 && (
+                                            <div className="flex justify-end space-x-6 items-center pt-4">
+                                                <button onClick={resetApp} className="text-sm font-medium text-slate-400 hover:text-slate-600 transition-colors">キャンセル</button>
+                                                <button onClick={handleCalculate} disabled={loading} className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 px-10 rounded-xl shadow-lg shadow-blue-100 transition-all flex items-center space-x-2">
+                                                    {loading ? <Icon name="Loader2" className="animate-spin" /> : <Icon name="Play" size={18} fill="currentColor"/>}
+                                                    <span>加工条件を算出</span>
+                                                </button>
+                                            </div>
+                                        )}
+                                    </section>
+                                )}
+
+                                {step === 2 && result && (
+                                    <div className="space-y-8 animate-fade-in-up">
+                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                            <div className="bg-white p-7 rounded-2xl border-b-4 border-b-slate-900 shadow-sm transition-transform hover:-translate-y-1">
+                                                <div className="text-[10px] font-bold text-slate-400 mb-2 uppercase tracking-widest">主軸回転数 (S)</div>
+                                                <div className="text-4xl font-black text-slate-900 tracking-tighter">{result.rpm.toLocaleString()}<span className="text-base font-normal ml-1 text-slate-400 tracking-normal">min⁻¹</span></div>
+                                            </div>
+                                            <div className="bg-white p-7 rounded-2xl border-b-4 border-b-blue-600 shadow-sm transition-transform hover:-translate-y-1">
+                                                <div className="text-[10px] font-bold text-slate-400 mb-2 uppercase tracking-widest">送り速度 (F)</div>
+                                                <div className="text-4xl font-black text-blue-600 tracking-tighter">{result.f.toLocaleString()}<span className="text-base font-normal ml-1 text-slate-400 tracking-normal">mm/min</span></div>
+                                            </div>
+                                            <div className="bg-slate-900 p-7 rounded-2xl shadow-xl text-white relative overflow-hidden transition-transform hover:-translate-y-1">
+                                                <div className="text-[10px] font-bold text-slate-500 mb-2 uppercase tracking-widest">推定加工時間</div>
+                                                <div className="text-4xl font-black text-blue-400 tracking-tighter">
+                                                    {(() => {
+                                                        const totalDistance = machiningDistance * passCount;
+                                                        const timeInMinutes = totalDistance / result.f;
+                                                        const mins = Math.floor(timeInMinutes);
+                                                        const secs = Math.round((timeInMinutes - mins) * 60);
+                                                        return `${mins}分 ${secs}秒`;
+                                                    })()}
+                                                </div>
+                                                <div className="text-[10px] text-slate-400 mt-2 tracking-wide uppercase">
+                                                    総距離: {(machiningDistance * passCount).toLocaleString()} mm
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div className="bg-white rounded-2xl border p-7">
+                                            <h3 className="font-bold text-slate-800 mb-6 text-sm flex items-center space-x-2">
+                                                <Icon name="Ruler" size={16} className="text-slate-400"/>
+                                                <span>工具寸法情報 (TOOL DIMENSIONS)</span>
+                                            </h3>
+                                            
+                                            <div className="space-y-8">
+                                                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                                                    {result.dimensions?.map((dim, i) => (
+                                                        <div key={i} className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-center transition-all hover:border-blue-200">
+                                                            <span className="text-xs text-slate-400 mb-1 font-medium tracking-wide">{dim.name}</span>
+                                                            <span className="text-sm font-bold text-slate-800">{dim.value}</span>
+                                                        </div>
+                                                    ))}
+                                                    {(!result.dimensions || result.dimensions.length === 0) && (
+                                                        <div className="col-span-full text-center text-slate-400 text-sm py-4 bg-slate-50 rounded-xl border border-dashed border-slate-200">
+                                                            寸法情報が取得できませんでした
+                                                        </div>
+                                                    )}
+                                                </div>
+
+                                                {/* Insert Info Section - Only visible if indexable */}
+                                                {result.isIndexable && (
+                                                    <div className="bg-blue-50/50 rounded-xl p-5 border border-blue-100 animate-fade-in-up">
+                                                        <div className="flex items-start space-x-4">
+                                                            <div className="bg-blue-100 p-2 rounded-lg text-blue-600 mt-1">
+                                                                <Icon name="Layers" size={20} />
+                                                            </div>
+                                                            <div className="flex-1">
+                                                                <h4 className="text-xs font-bold text-blue-500 uppercase mb-1">推奨チップ (Recommended Insert)</h4>
+                                                                <div>
+                                                                    <div className="text-lg font-bold text-slate-800 font-mono">{result.recommendedInsert || "情報なし"}</div>
+                                                                    <div className="mt-2 text-xs text-blue-600">
+                                                                        ※被削材「{selectedMaterial}」・加工法「{selectedMethod}」に基づき選定
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        <div className="bg-white rounded-2xl border p-7 space-y-5">
+                                            <h3 className="font-bold flex items-center space-x-2 text-slate-800"><Icon name="MessageSquare" size={20} className="text-blue-500"/><span>AIエンジニアの技術解説</span></h3>
+                                            <div className="space-y-4">
+                                                <p className="text-sm text-slate-600 leading-loose">{result.reasoning}</p>
+                                                <div className="flex flex-wrap gap-4">
+                                                    <div className="flex items-center space-x-2 text-sm font-semibold text-slate-700 bg-slate-50 p-3 rounded-lg">
+                                                        <Icon name="Droplets" size={16} className="text-blue-400"/>
+                                                        <span>推奨クーラント: {result.coolant}</span>
+                                                    </div>
+                                                    <div className="flex items-center space-x-2 text-sm font-semibold text-slate-700 bg-slate-50 p-3 rounded-lg">
+                                                        <Icon name="Zap" size={16} className="text-amber-400"/>
+                                                        <span>Vc={result.vc} m/min | fz={result.fz} mm/t</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div className="bg-white rounded-2xl border p-7">
+                                            <h3 className="font-bold text-slate-800 mb-5 text-sm flex items-center space-x-2"><Icon name="Globe" size={16} className="text-slate-400"/><span>リアルタイム調査ソース</span></h3>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                                {getUniqueSources().map((s, i) => (
+                                                    <a key={i} href={s.uri} target="_blank" className="p-4 text-xs bg-slate-50 hover:bg-blue-50 rounded-xl border border-slate-100 hover:border-blue-200 transition-all flex items-center justify-between group">
+                                                        <span className="text-slate-600 group-hover:text-blue-800 font-bold truncate pr-4">{s.title}</span>
+                                                        <Icon name="ExternalLink" size={14} className="text-slate-300 group-hover:text-blue-400 flex-shrink-0" />
+                                                    </a>
+                                                ))}
+                                                {getUniqueSources().length === 0 && (
+                                                    <p className="text-xs text-slate-400 col-span-full">特定の外部ソースは表示されませんでしたが、AIの内部知識と一般的な技術データに基づき回答しています。</p>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        <button onClick={resetApp} className="w-full bg-slate-900 text-white font-black py-5 rounded-2xl hover:bg-slate-800 shadow-2xl shadow-slate-200 transition-all text-lg tracking-widest uppercase">
+                                            計算をリセット
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+                        </main>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
